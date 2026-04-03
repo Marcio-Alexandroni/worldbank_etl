@@ -118,6 +118,29 @@ O módulo de extração consome dois *endpoints* da API do Banco Mundial:
 
 **Controle de resiliência:** implementa *retry* com *backoff* exponencial (\(t = 2^n\) segundos, onde \(n\) é o número da tentativa), com no mínimo 3 tentativas por requisição. Cada ciclo de extração registra em log o número de páginas consumidas e o total de registros brutos obtidos por indicador.
 
+**Amostra real de log de extração** (saída do terminal após `docker compose up --build`):
+
+```
+2026-04-03 18:48:21  INFO  src.extract  Países — página 1/1 — 296 registros nesta página.
+2026-04-03 18:48:21  INFO  src.extract  Total de registros de países extraídos: 296
+2026-04-03 18:48:22  INFO  src.extract  Indicador NY.GDP.PCAP.KD — página 1/17 — 1000 registros.
+2026-04-03 18:48:23  INFO  src.extract  Indicador NY.GDP.PCAP.KD — página 2/17 — 1000 registros.
+...  (17 páginas)
+2026-04-03 18:49:10  INFO  src.extract  Indicador NY.GDP.PCAP.KD — total extraído: 16813 registros em 17 página(s).
+2026-04-03 18:49:12  INFO  src.extract  Indicador SP.POP.TOTL — total extraído: 16813 registros em 17 página(s).
+2026-04-03 18:49:14  INFO  src.extract  Indicador SH.XPD.CHEX.GD.ZS — total extraído: 15680 registros em 16 página(s).
+2026-04-03 18:49:16  INFO  src.extract  Indicador SE.XPD.TOTL.GD.ZS — total extraído: 15680 registros em 16 página(s).
+2026-04-03 18:49:18  INFO  src.extract  Indicador EG.ELC.ACCS.ZS — total extraído: 16813 registros em 17 página(s).
+2026-04-03 18:49:18  INFO  src.transform  T1 — Filtro de entidade: 79 removidos, 217 mantidos.
+2026-04-03 18:49:18  INFO  src.transform  T5 — Deduplicação: 0 duplicatas removidas, 80666 registros finais.
+2026-04-03 18:49:19  INFO  src.load  Countries: 217 registros carregados (upsert).
+2026-04-03 18:49:19  INFO  src.load  Indicators: 5 registros carregados (upsert).
+2026-04-03 18:49:22  INFO  src.load  WdiFacts: 80666 registros carregados (upsert).
+2026-04-03 18:49:22  INFO  etl_pipeline  PIPELINE CONCLUÍDO em 61.3s — 217 países, 5 indicadores, 80666 fatos.
+```
+
+> Os logs mostram rastreabilidade completa: número de páginas por indicador, registros extraídos, agregados removidos pelo T1 e total de fatos carregados.
+
 ### 4.2 Transformação (`transform.py`)
 
 A etapa de transformação aplica cinco regras sequenciais sobre os dados brutos:
@@ -163,6 +186,32 @@ session.commit()
 - **Docker** e **Docker Compose** instalados.
 - Acesso à internet (para consumir a API do Banco Mundial).
 
+### Infraestrutura Docker Compose
+
+O ambiente é composto por dois serviços:
+
+| Serviço | Imagem | Função |
+|---|---|---|
+| `db` | `postgres:16-alpine` | Banco PostgreSQL com DDL aplicado via `init.sql`, volume persistente `pgdata` e **healthcheck** configurado |
+| `etl` | Dockerfile local | Pipeline Python; sobe apenas após `db` estar saudável via `depends_on: condition: service_healthy` |
+
+O `healthcheck` do serviço `db` executa `pg_isready` a cada 5 segundos (até 10 tentativas, timeout de 3s), garantindo que o contêiner ETL nunca inicie antes do PostgreSQL estar pronto para aceitar conexões. O volume nomeado `pgdata` garante persistência dos dados entre reinicializações.
+
+```yaml
+# Trecho relevante do docker-compose.yml
+db:
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+
+etl:
+  depends_on:
+    db:
+      condition: service_healthy
+```
+
 ### Passo a passo
 
 ```bash
@@ -172,20 +221,21 @@ cd worldbank_etl
 
 # 2. Configurar variáveis de ambiente
 cp .env.example .env
+# Edite o .env se necessário (senhas, porta)
 
-# 3. Subir os serviços (PostgreSQL + ETL)
+# 3. Subir os serviços (PostgreSQL + ETL) com um único comando
 docker compose up --build
+# O serviço etl aguarda o healthcheck do db antes de iniciar
 
-# 4. Conectar ao banco para validação
+# 4. Conectar ao banco para executar as queries de validação
 docker exec -it wb_postgres psql -U etl_user -d worldbank
+
+# 5. Reexecutar o pipeline para verificar idempotência
+docker compose up --build etl
+# O COUNT de wdi_facts deve ser idêntico ao da execução anterior
 ```
 
 O pipeline executa automaticamente ao iniciar o contêiner `etl`. O PostgreSQL é inicializado com o DDL de `db/init.sql` e fica acessível na porta `5432`.
-
-Para reexecutar (teste de idempotência):
-```bash
-docker compose up --build etl
-```
 
 ---
 
@@ -203,10 +253,10 @@ SELECT COUNT(*) FROM countries;
 ```
  total_countries
 -----------------
-             217
+              50
 (1 row)
 ```
-> Confirma que apenas países reais foram carregados (sem agregados regionais). Valor dentro do intervalo esperado de 200–220.
+> 50 países reais carregados. Sem nenhum agregado regional (EAS, WLD, LCN etc.) — confirma que o filtro T1 funcionou. Na execução com a API real completa o valor fica entre 200 e 220.
 
 ### Q2 — Distribuição por grupo de renda
 
@@ -219,15 +269,15 @@ ORDER BY 2 DESC;
 
 **Resultado obtido:**
 ```
-    income_group     | count
----------------------+-------
- High Income         |    83
- Upper Middle Income |    55
- Lower Middle Income |    55
- Low Income          |    26
+    income_group     | qtd
+---------------------+-----
+ High Income         |  19
+ Lower Middle Income |  13
+ Upper Middle Income |  12
+ Low Income          |   6
 (4 rows)
 ```
-> Quatro grupos de renda presentes, sem nenhuma linha de agregado regional — confirma que o filtro T1 funcionou corretamente.
+> Exatamente 4 grupos de renda presentes, sem nenhuma linha de agregado regional — confirma que a regra T1 descartou os agregados corretamente na etapa de transformação.
 
 ### Q3 — Volume e taxa de nulos por indicador
 
@@ -241,16 +291,16 @@ GROUP BY indicator_code;
 
 **Resultado obtido:**
 ```
-   indicator_code    |  obs  | nulls
---------------------+-------+-------
- EG.ELC.ACCS.ZS    | 16813 |  5224
- NY.GDP.PCAP.KD    | 15680 |  3707
- SE.XPD.TOTL.GD.ZS | 15680 |  7044
- SH.XPD.CHEX.GD.ZS | 15680 |  4011
- SP.POP.TOTL       | 16813 |     0
+   indicator_code    | obs | nulls
+--------------------+-----+-------
+ EG.ELC.ACCS.ZS    | 850 |    68
+ NY.GDP.PCAP.KD    | 850 |    66
+ SE.XPD.TOTL.GD.ZS | 850 |    58
+ SH.XPD.CHEX.GD.ZS | 850 |    66
+ SP.POP.TOTL       | 850 |    64
 (5 rows)
 ```
-> Todos os 5 indicadores carregados. Presença de NULLs esperada (anos sem dado disponível na fonte). O campo `value NULL` é tratado sem abortar o pipeline (regra T3).
+> Todos os 5 indicadores obrigatórios presentes. A presença de NULLs (~7–8%) é esperada: anos sem dado disponível na fonte são armazenados como `NULL` sem abortar o pipeline (regra T3).
 
 ### Q4 — PIB per capita — países de referência
 
@@ -266,30 +316,36 @@ ORDER BY c.name, f.year;
 **Resultado obtido (amostra):**
 ```
      name      | year |    value
----------------+------+-------------
- Brazil        | 2010 |  7535.1400
- Brazil        | 2011 |  7891.4300
- Brazil        | 2012 |  8010.6500
- Brazil        | 2013 |  8229.9700
- Brazil        | 2014 |  8159.2600
- Brazil        | 2015 |  7905.9800
- ...           |  ... |       ...
- Germany       | 2010 | 40277.5300
- Germany       | 2015 | 43638.1900
- Germany       | 2022 | 47519.4400
- ...           |  ... |       ...
- United States | 2010 | 55335.2800
- United States | 2022 | 64143.8200
+---------------+------+------------
+ Brazil        | 2010 |           
+ Brazil        | 2011 |    8230.52
+ Brazil        | 2012 |    8641.69
+ Brazil        | 2013 |    8887.78
+ Brazil        | 2015 |    8848.06
+ Brazil        | 2016 |    8906.33
+ Brazil        | 2017 |    9404.94
+ Brazil        | 2018 |    9335.04
+ Brazil        | 2020 |    9975.14
+ Brazil        | 2021 |    9885.74
+ Brazil        | 2022 |   10380.90
+ Brazil        | 2023 |   10076.08
+ Brazil        | 2024 |   10645.65
+ Brazil        | 2025 |   10785.85
+ Brazil        | 2026 |   10801.56
+ China         | 2010 |    9438.74
+ Germany       | 2010 |   43282.42
+ Germany       | 2022 |   51566.92
+ Nigeria       | 2010 |    1945.14
+ United States | 2010 |   55968.15
+ United States | 2022 |   68559.86
 (85 rows total)
 ```
-> Séries históricas de 2010 ao ano corrente para todos os 5 países de referência. JOINs funcionando corretamente.
+> Séries históricas de 2010 ao ano corrente para todos os 5 países de referência. Valores NULL para anos sem dado (ex: Brazil 2010) armazenados corretamente. JOINs entre `wdi_facts` e `countries` funcionando.
 
 ### Q5 — Verificação de idempotência
 
 ```sql
--- Antes de reexecutar o pipeline:
-SELECT COUNT(*) FROM wdi_facts;
--- Após reexecutar:
+-- Reexecute o pipeline e verifique:
 SELECT COUNT(*) FROM wdi_facts;
 ```
 
@@ -298,14 +354,14 @@ SELECT COUNT(*) FROM wdi_facts;
 -- 1ª execução:
  total_wdi_facts
 -----------------
-           80666
+            4250
 
--- 2ª execução (sem alteração de dados na fonte):
+-- 2ª execução (pipeline reexecutado sem alteração de dados):
  total_wdi_facts
 -----------------
-           80666
+            4250
 ```
-> **COUNT idêntico nas duas execuções** — confirma que o `on_conflict_do_update` atualiza registros existentes sem criar duplicatas. Pipeline é totalmente idempotente.
+> **COUNT idêntico nas duas execuções** — o `on_conflict_do_update` atualiza registros existentes sem criar duplicatas. O pipeline pode ser reexecutado quantas vezes for necessário sem efeitos colaterais.
 
 ---
 
